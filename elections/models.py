@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 from datetime import timedelta
 from typing import List, Optional, Union
+import re
 
 from django.db import models
 from django.utils import timezone
@@ -615,8 +616,6 @@ class BallotWebsite(TimeStampedModel):
             district, created = District.objects.get_or_create(
                 category=category, name=helpers.titleize(td.text)
             )
-            # We expect all districts to exist in the system through crawling,
-            # but circuit court districts are only created when checking status
             if created:
                 log.warn(f'Added missing district: {district}')
 
@@ -704,6 +703,8 @@ class BallotWebsite(TimeStampedModel):
 
         # Parse district
 
+        proposal_title = table.find(class_='proposalTitle').text
+        proposal_text = table.find(class_='proposalText').text
         if category.name == "County":
             log.debug('Inferring district as county')
             district = precinct.county
@@ -711,23 +712,28 @@ class BallotWebsite(TimeStampedModel):
             log.debug('Inferring district as jurisdiction')
             district = precinct.jurisdiction
         else:
-            proposal_title = table.find(class_='proposalTitle').text
-            proposal_text = table.find(class_='proposalText').text
-            log.debug(f'Parsing district from title: {proposal_title!r}')
-            title = helpers.titleize(proposal_title)
-            if category.name in title:
-                district = District.objects.get(
-                    category=category,
-                    name=title.split(category.name)[0].strip(),
-                )
-            elif precinct.jurisdiction.name in proposal_text:
-                log.warn('Assuming district is jurisdiction from proposal')
-                district = precinct.jurisdiction
-            elif precinct.county.name in proposal_text:
-                log.warn('Assuming district is county from proposal')
-                district = precinct.county
+            log.debug(f'Parsing district from text: {proposal_text!r}')
+            if "School" in category.name:
+                category_name = "Schools"
             else:
-                assert 0, f'Could not determine district: {table}'
+                category_name = category.name
+
+            best_match = None
+            for word in {"the", "in", "to"}:
+                match = re.search(
+                    f'{word} (.{5,100}? {category_name})', proposal_text
+                )
+                if match:
+                    log.debug(f'Found match: {match[0]}')
+                    if not best_match or len(match[0]) < len(best_match[0]):
+                        best_match = match
+            assert best_match
+
+            district, created = District.objects.get_or_create(
+                category=category, name=best_match[1]
+            )
+            if created:
+                log.warn(f'Added missing district: {district}')
 
         log.info(f'Parsed {district!r}')
         assert district
