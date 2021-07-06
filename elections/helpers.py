@@ -11,13 +11,12 @@ import requests
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 from nameparser import HumanName
-from rest_framework.exceptions import APIException
 
+from . import exceptions
+from .constants import MI_SOS_URL
 
-MI_SOS_URL = "https://mvic.sos.state.mi.us"
 
 useragent = UserAgent()
-
 
 ###############################################################################
 # Shared helpers
@@ -29,11 +28,28 @@ def titleize(text: str) -> str:
         .replace(" Of ", " of ")
         .replace(" To ", " to ")
         .replace(" And ", " and ")
+        .replace(" In ", " in ")
+        .replace(" By ", " by ")
+        .replace(" At ", " at ")
+        .replace("U.s.", "U.S.")
+        .replace("Ii.", "II.")
+        .replace("(d", "(D")
+        .replace("(l", "(L")
+        .replace("(r", "(R")
         .strip()
     )
 
 
 def normalize_candidate(text: str) -> str:
+    if '\n' in text:
+        log.debug(f'Handling running mate: {text}')
+        text1, text2 = text.split('\n')
+        name1 = HumanName(text1.strip())
+        name2 = HumanName(text2.strip())
+        name1.capitalize()
+        name2.capitalize()
+        return str(name1) + ' & ' + str(name2)
+
     name = HumanName(text.strip())
     name.capitalize()
     return str(name)
@@ -44,11 +60,12 @@ def normalize_jurisdiction(name: str) -> str:
 
     for kind in {'City', 'Township', 'Village'}:
         if name.startswith(kind):
-            return name
+            return name.replace(" Charter", "")
 
     for kind in {'City', 'Township', 'Village'}:
         if name.endswith(' ' + kind):
-            return kind + ' of ' + name[: -len(kind) - 1]
+            name = kind + ' of ' + name[: -len(kind) - 1]
+            return name.replace(" Charter", "")
 
     return name
 
@@ -83,22 +100,16 @@ def _get_mvic_session(*, random_agent: bool = True):
         yield sess
 
 
-class ServiceUnavailable(APIException):
-    status_code = 503
-    default_code = 'service_unavailable'
-    default_detail = f'The Michigan Secretary of State website ({MI_SOS_URL}) is temporarily unavailable, please try again later.'
-
-
 def _check_availability(response):
     if response.status_code >= 400:
         log.error(f'MI SOS status code: {response.status_code}')
-        raise ServiceUnavailable()
+        raise exceptions.ServiceUnavailable()
 
     html = BeautifulSoup(response.text, 'html.parser')
     div = html.find(id='pollingLocationError')
     if div:
         if div['style'] != 'display:none;':
-            raise ServiceUnavailable()
+            raise exceptions.ServiceUnavailable()
 
 
 def fetch_registration_status_data(voter):
@@ -117,21 +128,6 @@ def fetch_registration_status_data(voter):
         _check_availability(response)
 
         # Handle recently moved voters
-        if "you have recently moved" in response.text:
-            # TODO: Figure out what a moved voter looks like
-            bugsnag.notify(
-                RuntimeError("Voter has moved"),
-                meta_data={"voter": repr(voter), "html": response.text},
-            )
-            log.warn(f"Handling recently moved voter: {voter}")
-            page = _find_or_abort(
-                r"<a href='(registeredvoter\.aspx\?vid=\d+)' class=VITlinks>Begin",
-                response.text,
-            )
-            url = MI_SOS_URL + page
-            response = sess.get(url)
-            log.debug(f"Response from MI SOS:\n{response.text}")
-            _check_availability(response)
 
     # Parse registration
     registered = None
@@ -142,14 +138,49 @@ def fetch_registration_status_data(voter):
     else:
         log.warn("Unable to determine registration status")
 
+    # Parse moved status
+    recently_moved = "you have recently moved" in response.text
+    if recently_moved:
+        # TODO: Figure out how to request the new records
+        bugsnag.notify(
+            exceptions.UnhandledData("Voter has moved"),
+            meta_data={"voter": repr(voter), "html": response.text},
+        )
+
+    # Parse absentee status
+    absentee = "You are on the permanent absentee voter list" in response.text
+
     # Parse districts
-    districs = {}
+    districts = {}
     for match in re.findall(r'>([\w ]+):[\s\S]*?">([\w ]*)<', response.text):
         category = _clean_district_category(match[0])
-        if category not in {'Phone'}:
-            districs[category] = _clean_district_name(match[1])
+        if category == "Jurisdiction":
+            districts[category] = normalize_jurisdiction(match[1])
+        elif category not in {'Phone', 'Mailing Address', 'Open'}:
+            districts[category] = _clean_district_name(match[1])
 
-    return {"registered": registered, "districts": districs}
+    # Parse Polling Location
+    polling_location = {
+        "PollingLocation": "",
+        "PollAddress": "",
+        "PollCityStateZip": "",
+    }
+    for key in polling_location:
+        index = response.text.find('lbl' + key)
+        if index == -1:
+            log.warn("Could not find polling location.")
+        else:
+            newstring = response.text[(index + len(key) + 5) :]
+            end = newstring.find('<')
+            polling_location[key] = newstring[0:end]
+
+    return {
+        "registered": registered,
+        "absentee": absentee,
+        "districts": districts,
+        "polling_location": polling_location,
+        "recently_moved": recently_moved,
+    }
 
 
 def _find_or_abort(pattern: str, text: str):
@@ -197,7 +228,7 @@ def parse_precinct(html: str, url: str) -> Tuple[str, str, str, str]:
     """Parse precinct information from ballot HTML."""
 
     # Parse county
-    match = re.search(r'(?P<county>[^>]+) County, Michigan', html)
+    match = re.search(r'(?P<county>[^>]+) County, Michigan', html, re.IGNORECASE)
     assert match, f'Unable to find county name: {url}'
     county = titleize(match.group('county'))
 
@@ -229,21 +260,20 @@ def parse_precinct(html: str, url: str) -> Tuple[str, str, str, str]:
     return county, jurisdiction, ward, precinct
 
 
-def parse_district_from_proposal(category: str, text: str) -> str:
-    for match in re.finditer(f'(the|authorizes) (.+? {category})', text):
-        log.debug(f'Matched district in proposal: {match.groups()}')
-        name = match[2].strip()
-        if name[0].isupper() and len(name) < 100:
-            return name
+def parse_district_from_proposal(category: str, text: str, mi_sos_url: str) -> str:
+    patterns = [
+        f'[a-z] ((?:[A-Z][A-Za-z.-]+ )+{category})',
+        f'\n((?:[A-Z][A-Za-z.-]+ )+{category})',
+    ]
 
-    match = re.search('Shall (.+?), Michigan', text)  # type: ignore
-    if match:
-        log.debug(f'Matched district in proposal: {match.groups()}')
-        name = match[1].strip()
-        if name[0].isupper() and len(name) < 100:
-            return name
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            name = match[1].strip()
+            log.debug(f'{pattern!r} matched: {name}')
+            if len(name) < 100:
+                return name
 
-    raise ValueError(f'Could not find {category}: {text}')
+    raise ValueError(f'Could not find {category!r} in {text!r} on {mi_sos_url}')
 
 
 def parse_ballot(html: str, data: Dict) -> int:
@@ -253,8 +283,142 @@ def parse_ballot(html: str, data: Dict) -> int:
         1
     ]
     count = 0
+    count += parse_primary_election_offices(ballot, data)
     count += parse_general_election_offices(ballot, data)
     count += parse_proposals(ballot, data)
+    return count
+
+
+def parse_primary_election_offices(ballot: BeautifulSoup, data: Dict) -> int:
+    """Inserts primary election ballot data into the provided dictionary."""
+    count = 0
+
+    offices = ballot.find(id='twoPartyPrimaryElectionOffices')
+    if not offices:
+        return count
+
+    assert ballot.find(id='primaryColumnHeading1').text.strip() == 'DEMOCRATIC PARTY'
+    assert ballot.find(id='primaryColumnHeading2').text.strip() == 'REPUBLICAN PARTY'
+
+    section: Dict = {}
+    label = 'primary section'
+    data[label] = section
+
+    count += _parse_primary_election_offices("Democratic", ballot, section)
+    count += _parse_primary_election_offices("Republican", ballot, section)
+    return count
+
+
+def _parse_primary_election_offices(
+    party: str, ballot: BeautifulSoup, data: Dict
+) -> int:
+    """Inserts primary election ballot data into the provided dictionary."""
+    count = 0
+
+    offices = ballot.find(
+        id='columnOnePrimary' if party == 'Democratic' else 'columnTwoPrimary'
+    )
+    if not offices:
+        return count
+
+    section: Dict[str, Any] = {}
+    division: Optional[List] = None
+    data[party] = section
+
+    for index, item in enumerate(
+        offices.find_all(
+            'div',
+            {
+                "class": [
+                    "division",
+                    "office",
+                    "term",
+                    "candidate",
+                    "financeLink",
+                    "party",
+                ]
+            },
+        ),
+        start=1,
+    ):
+        log.debug(f'Parsing office item {index}: {item}')
+
+        if "division" in item['class']:
+            label = (
+                titleize(item.text).replace(" - Continued", "").replace(" District", "")
+            )
+            try:
+                division = section[label]
+            except KeyError:
+                division = []
+            section[label] = division
+            office = None
+
+        elif "office" in item['class']:
+            label = titleize(item.text)
+            assert division is not None, f'Division missing for office: {label}'
+            office = {
+                'name': label,
+                'district': None,
+                'type': None,
+                'term': None,
+                'seats': None,
+                'incumbency': None,
+                'candidates': [],
+            }
+            division.append(office)
+
+        elif "term" in item['class']:
+            label = item.text
+            assert office is not None, f'Office missing for term: {label}'
+            if "Incumbent" in label:
+                office['type'] = label
+            elif "Term" in label:
+                office['term'] = label
+            elif "Vote for" in label:
+                office['seats'] = int(label.replace("Vote for not more than ", ""))
+            elif label in {"Incumbent Position", "New Judgeship"}:
+                office['incumbency'] = label
+            else:
+                # TODO: Remove this assert after parsing an entire general election
+                assert (
+                    "WARD" in label
+                    or "DISTRICT" in label
+                    or "COURT" in label
+                    or "COLLEGE" in label
+                    or "Village of " in label
+                    or label.endswith(" SCHOOL")
+                    or label.endswith(" SCHOOLS")
+                    or label.endswith(" ISD")
+                    or label.endswith(" ESA")
+                    or label.endswith(" COMMUNITY")
+                    or label.endswith(" LIBRARY")
+                ), f'Unhandled term: {label}'  # pylint: disable=too-many-boolean-expressions
+                office['district'] = titleize(label)
+            count += 1
+
+        elif "candidate" in item['class']:
+            label = normalize_candidate(item.get_text('\n'))
+            assert office is not None, f'Office missing for candidate: {label}'
+            if label == 'No candidates on ballot':
+                continue
+            candidate: Dict[str, Any] = {
+                'name': label,
+                'finance_link': None,
+                'party': None,
+            }
+            office['candidates'].append(candidate)
+            count += 1
+
+        elif "financeLink" in item['class']:
+            if item.a:
+                candidate['finance_link'] = item.a['href']
+
+        elif "party" in item['class']:
+            label = titleize(item.text)
+            assert candidate is not None, f'Candidate missing for party: {label}'
+            candidate['party'] = label or None
+
     return count
 
 
@@ -266,6 +430,7 @@ def parse_general_election_offices(ballot: BeautifulSoup, data: Dict) -> int:
     if not offices:
         return count
 
+    section: Optional[Dict] = None
     for index, item in enumerate(
         offices.find_all(
             'div',
@@ -286,16 +451,26 @@ def parse_general_election_offices(ballot: BeautifulSoup, data: Dict) -> int:
         log.debug(f'Parsing office item {index}: {item}')
 
         if "section" in item['class']:
-            section: Dict[str, Any] = {}
+            section = {}
             division: Optional[List] = None
             office: Optional[Dict] = None
             label = item.text.lower()
-            assert label not in data, f'Duplicate section: {label}'
-            data[label] = section
+            if label in data:
+                log.warning(f'Duplicate section on ballot: {label}')
+                section = data[label]
+            else:
+                data[label] = section
 
         elif "division" in item['class']:
             office = None
-            label = titleize(item.text.replace(' - Continued', ''))
+            label = (
+                titleize(item.text).replace(" - Continued", "").replace(" District", "")
+            )
+            if section is None:
+                log.warn(f"Section missing for division: {label}")
+                assert list(data.keys()) == ['primary section']
+                section = {}
+                data['nonpartisan section'] = section
             try:
                 division = section[label]
             except KeyError:
@@ -306,33 +481,58 @@ def parse_general_election_offices(ballot: BeautifulSoup, data: Dict) -> int:
         elif "office" in item['class']:
             label = titleize(item.text)
             assert division is not None, f'Division missing for office: {label}'
-            office = {'name': label, 'term': None, 'seats': None, 'candidates': []}
+            office = {
+                'name': label,
+                'district': None,
+                'type': None,
+                'term': None,
+                'seats': None,
+                'incumbency': None,
+                'candidates': [],
+            }
             division.append(office)
 
         elif "term" in item['class']:
             label = item.text
             assert office is not None, f'Office missing for term: {label}'
-            if "Term" in label:
+            if "Incumbent" in label:
+                office['type'] = label
+            elif "Term" in label:
                 office['term'] = label
             elif "Vote for" in label:
                 office['seats'] = int(label.replace("Vote for not more than ", ""))
-            elif "WARD" in label:
-                office['term'] = titleize(label)
+            elif label in {"Incumbent Position", "New Judgeship"}:
+                office['incumbency'] = label
             else:
-                raise ValueError(f"Unhandled term: {label}")
+                # TODO: Remove this assert after parsing an entire general election
+                assert (
+                    "WARD" in label
+                    or "DISTRICT" in label
+                    or "COURT" in label
+                    or "COLLEGE" in label
+                    or "Village of " in label
+                    or label.endswith(" SCHOOL")
+                    or label.endswith(" SCHOOLS")
+                    or label.endswith(" ISD")
+                    or label.endswith(" ESA")
+                    or label.endswith(" COMMUNITY")
+                    or label.endswith(" LIBRARY")
+                ), f'Unhandled term: {label}'  # pylint: disable=too-many-boolean-expressions
+                office['district'] = titleize(label)
             count += 1
 
         elif "candidate" in item['class']:
-            label = normalize_candidate(item.text)
+            label = normalize_candidate(item.get_text('\n'))
             assert office is not None, f'Office missing for candidate: {label}'
+            if label == 'No candidates on ballot':
+                continue
             candidate = {'name': label, 'finance_link': None, 'party': None}
             office['candidates'].append(candidate)
             count += 1
 
         elif "financeLink" in item['class']:
-            label = item.text.strip()
-            assert candidate is not None, f'Candidate missing for finance link: {label}'
-            candidate['finance_link'] = label or None
+            if item.a:
+                candidate['finance_link'] = item.a['href']
 
         elif "party" in item['class']:
             label = titleize(item.text)

@@ -3,22 +3,23 @@
 import sys
 from datetime import timedelta
 from pathlib import Path
+from typing import Dict, Generator, Tuple
 
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 import log
 
-from elections import defaults
-from elections.helpers import normalize_jurisdiction
-from elections.models import District, DistrictCategory, Election, Party, Position
+from elections import defaults, helpers
+from elections.models import District, DistrictCategory, Election, Position
 
 
 class Command(BaseCommand):
     help = "Initialize contants and migrate data between existing models"
 
     def handle(self, verbosity: int, **_kwargs):
-        log.init(verbosity=verbosity if '-v' in sys.argv else 2)
+        log.reset()
+        log.init(verbosity=verbosity if '-v' in sys.argv[-1] else 2)
 
         defaults.initialize_parties()
         defaults.initialize_districts()
@@ -31,7 +32,7 @@ class Command(BaseCommand):
 
     def update_elections(self):
         for election in Election.objects.filter(active=True):
-            age = timezone.now() - timedelta(weeks=3)
+            age = timezone.now() - timedelta(weeks=2)
             if election.date < age.date():
                 log.info(f'Deactivating election: {election}')
                 election.active = False
@@ -40,12 +41,9 @@ class Command(BaseCommand):
     def update_jurisdictions(self):
         jurisdiction = DistrictCategory.objects.get(name="Jurisdiction")
         for district in District.objects.filter(category=jurisdiction):
-
             old = district.name
-            new = normalize_jurisdiction(district.name)
-
+            new = helpers.normalize_jurisdiction(old)
             if new != old:
-
                 if District.objects.filter(category=jurisdiction, name=new):
                     log.warning(f'Deleting district {old!r} in favor of {new!r}')
                     district.delete()
@@ -55,7 +53,42 @@ class Command(BaseCommand):
                     district.save()
 
     def import_descriptions(self):
-        pass
+        for name, description in self._read_descriptions('elections'):
+            elections = Election.objects.filter(name=name)
+            if elections:
+                for election in elections:
+                    if description and election.description != description:
+                        log.info(f'Updating description for {name}')
+                        election.description = description
+                        election.save()
+            else:
+                log.warning(f'Election not found in database: {name}')
+
+        for name, description in self._read_descriptions('districts'):
+            try:
+                category = DistrictCategory.objects.get(name=name)
+            except DistrictCategory.DoesNotExist as e:
+                message = f'District category not found in database: {name}'
+                if name in {'Precinct'}:
+                    log.warning(message)
+                else:
+                    log.error(message)
+                    raise e from None
+            if description and category.description != description:
+                log.info(f'Updating description for {name}')
+                category.description = description
+                category.save()
+
+        for name, description in self._read_descriptions('positions'):
+            positions = Position.objects.filter(name=name)
+            if positions:
+                for position in positions:
+                    if description and position.description != description:
+                        log.info(f'Updating description for {name}')
+                        position.description = description
+                        position.save()
+            else:
+                log.warning(f'Position not found in database: {name}')
 
     def export_descriptions(self):
         elections = {}
@@ -68,19 +101,22 @@ class Command(BaseCommand):
             districts[category.name] = category.description
         self._write('districts', districts)
 
-        parties = {}
-        for party in Party.objects.all():
-            parties[party.name] = party.description
-        self._write('parties', parties)
-
         positions = {}
         for position in Position.objects.all():
-            positions[position.name] = position.description
+            name = position.name.split('(')[0].strip()
+            positions[name] = position.description
         self._write('positions', positions)
 
-    def _write(self, name, data):
-        with Path(f'content/{name}.txt').open('w') as f:
-            for key, value in sorted(data.items()):
-                f.write(f'name: {key}\n')
-                f.write(f'description: {value}\n')
-                f.write('\n')
+    def _read_descriptions(self, name: str) -> Generator[Tuple[str, str], None, None]:
+        for path in Path(f'content/{name}').iterdir():
+            if path.name.startswith('.'):
+                continue
+            log.debug(f'Reading {path}')
+            yield path.stem, path.read_text().strip()
+
+    def _write(self, name: str, data: Dict) -> None:
+        for key, value in sorted(data.items()):
+            path = Path(f'content/{name}/{key}.md')
+            with path.open('w') as f:
+                log.debug(f'Writing {path}')
+                f.write(value + '\n')

@@ -1,10 +1,12 @@
-# pylint: disable=no-self-use
+# pylint: disable=no-self-use,broad-except
 
+import os
 import sys
-import warnings
+from typing import Optional
 
 from django.core.management.base import BaseCommand
 
+import bugsnag
 import log
 
 from elections.commands import parse_ballots
@@ -15,15 +17,23 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
-            '--refetch',
-            action='store_true',
-            help='Fetch, validate, and scrape ballots again if parsing fails.',
+            '--election',
+            metavar='MI_SOS_ID',
+            type=int,
+            default=None,
+            help='Michigan SOS election ID to parse ballots for.',
         )
 
-    def handle(self, verbosity: int, refetch: bool, **_kwargs):
-        log.init(verbosity=verbosity if '-v' in sys.argv else 2)
+    def handle(self, verbosity: int, election: Optional[int], **_kwargs):
+        log.reset()
+        log.init(reset=True, verbosity=verbosity if '-v' in sys.argv[-1] else 2)
 
-        # https://github.com/citizenlabsgr/elections-api/issues/81
-        warnings.simplefilter('once')
-
-        parse_ballots(refetch=refetch)
+        try:
+            parse_ballots(election_id=election)
+        except Exception as e:
+            if 'HEROKU_APP_NAME' in os.environ:
+                log.error("Unable to finish parsing data", exc_info=e)
+                bugsnag.notify(e)
+                sys.exit(1)
+            else:
+                raise e from None

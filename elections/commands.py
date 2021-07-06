@@ -8,15 +8,18 @@ from .models import Ballot, BallotWebsite, Election, Precinct
 
 def scrape_ballots(
     *,
-    start: int = 1,
-    limit: Optional[int] = None,
+    starting_election_id: Optional[int] = None,
+    starting_precinct_id: int = 1,
+    ballot_limit: Optional[int] = None,
     max_election_error_count: int = 3,
-    max_ballot_error_count: int = 100,
+    max_ballot_error_count: int = 1000,
 ):
     last_election = Election.objects.exclude(active=True).last()
     current_election = Election.objects.filter(active=True).first()
 
-    if current_election:
+    if starting_election_id is not None:
+        pass  # use the provided ID
+    elif current_election:
         starting_election_id = current_election.mi_sos_id
     elif last_election:
         starting_election_id = last_election.mi_sos_id + 1
@@ -27,7 +30,7 @@ def scrape_ballots(
     error_count = 0
     for election_id in itertools.count(starting_election_id):
         ballot_count = _scrape_ballots_for_election(
-            election_id, start, limit, max_ballot_error_count
+            election_id, starting_precinct_id, ballot_limit, max_ballot_error_count
         )
 
         if ballot_count:
@@ -39,7 +42,7 @@ def scrape_ballots(
             log.info(f'No more ballots to scrape')
             break
 
-        if limit and ballot_count >= limit:
+        if ballot_limit and ballot_count >= ballot_limit:
             log.info(f'Stopping after fetching {ballot_count} ballot(s)')
             break
 
@@ -83,39 +86,51 @@ def _scrape_ballots_for_election(
     return ballot_count
 
 
-def parse_ballots(*, refetch: bool = False):
-    for election in Election.objects.filter(active=True):
+def parse_ballots(*, election_id: Optional[int] = None):
+    if election_id:
+        elections = Election.objects.filter(mi_sos_id=election_id)
+    else:
+        elections = Election.objects.filter(active=True)
 
-        precincts: Set[Precinct] = set()
+    for election in elections:
+        _parse_ballots_for_election(election)
 
-        for ballot in Ballot.objects.filter(election=election):
-            if ballot.website:
-                ballot.website = None
-                ballot.save()
 
-        for website in BallotWebsite.objects.filter(
-            mi_sos_election_id=election.mi_sos_id, valid=True
-        ).order_by('-mi_sos_precinct_id'):
+def _parse_ballots_for_election(election: Election):
+    log.info(f'Parsing ballots for election {election.mi_sos_id}')
 
-            ballot = website.convert()
+    precincts: Set[Precinct] = set()
 
-            if ballot.precinct in precincts:
-                log.warn(f'Duplicate website: {website}')
-            else:
-                precincts.add(ballot.precinct)
+    ballots = Ballot.objects.filter(election=election)
+    log.info(f'Resetting websites for {ballots.count()} ballots')
+    for ballot in ballots:
+        if ballot.website:
+            ballot.website = None
+            ballot.save()
 
-                ballot.website = website
+    websites = (
+        BallotWebsite.objects.filter(mi_sos_election_id=election.mi_sos_id, valid=True)
+        .order_by('-mi_sos_precinct_id')
+        .defer('mi_sos_html', 'data')
+    )
+    log.info(f'Mapping {websites.count()} websites to ballots')
 
-                try:
-                    ballot.parse()
-                except Exception as e:  # pylint: disable=broad-except
-                    if refetch:
-                        log.warning(str(e))
-                        ballot.website.fetch()
-                        ballot.website.validate()
-                        ballot.website.scrape()
-                        ballot.parse()
-                    else:
-                        raise e from None
+    for website in websites:
 
-                ballot.save()
+        if not website.data:
+            website.scrape()
+
+        ballot = website.convert()
+
+        if ballot.precinct in precincts:
+            log.warn(f'Duplicate website: {website}')
+        else:
+            precincts.add(ballot.precinct)
+
+            ballot.website = website
+            ballot.save()
+
+            if ballot.stale:
+                ballot.parse()
+
+    log.info(f'Parsed ballots for {len(precincts)} precincts')

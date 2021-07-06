@@ -18,7 +18,7 @@ doctor: ## System | Check for the required system dependencies
 .PHONY: install
 install: .venv/flag ## Project | Install project dependencies
 .venv/flag: poetry.lock runtime.txt requirements.txt
-	@ poetry config virtualenvs.in-project true || poetry config settings.virtualenvs.in-project true
+	@ poetry config virtualenvs.in-project true
 	poetry install
 	@ mkdir -p staticfiles
 	@ touch $@
@@ -33,7 +33,7 @@ runtime.txt: .python-version
 	echo "python-$(shell cat $<)" > $@
 
 requirements.txt: poetry.lock
-	poetry export --format requirements.txt --output $@ --without-hashes || echo "ERROR: Poetry 1.x required to export dependencies"
+	poetry export --format requirements.txt --output $@ --without-hashes
 
 endif
 
@@ -77,9 +77,11 @@ endif
 .PHONY: test
 test: install ## CI | Run all tests
 	poetry run pytest elections tests
+	poetry run coveragespace citizenlabsgr/elections-api overall --exit-code
 
 .PHONY: watch
 watch: install
+	@ rm -f .cache/v/cache/lastfailed
 	poetry run ptw
 
 .PHONY: notebook
@@ -100,9 +102,10 @@ migrate: install ## Data | Run database migrations
 
 .PHONY: data
 data: migrate ## Data | Seed data for manual testing
+	@ echo
 	poetry run python manage.py seed_data
 	@ echo
-	poetry run python manage.py scrape_data --start=1792 --limit=5
+	poetry run python manage.py scrape_data --start-precinct=1828 --ballot-limit=5
 	@ echo
 	poetry run python manage.py parse_data
 

@@ -1,0 +1,1 @@
+Responsible for keeping the peace and enforcing the law. They operate the county jail, serve and execute all civil writs and process as well as criminal process that are issued pursuant to rule, and produce and maintain records as prescribed by law.

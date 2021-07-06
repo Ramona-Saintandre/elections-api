@@ -15,10 +15,23 @@ def index(request):
         text = readme.read()
 
     text = text.split('<!-- content -->')[1]
+    text = text.replace(
+        "Michigan.",
+        """
+        Michigan.
+        <br>
+        <button class="btn btn-primary mt-3" onclick="location.href='https://share.michiganelections.io'">
+            Find Your Ballot
+        </button>
+        """,
+        1,
+    )
     text = text.replace('https://michiganelections.io', settings.BASE_URL)
     text = text.replace('>michiganelections.io', f'>{settings.BASE_DOMAIN}')
 
-    html = markdown(text, extensions=['pymdownx.magiclink'])
+    html = markdown(
+        text, extensions=['pymdownx.magiclink', 'markdown.extensions.tables']
+    )
     html = html.replace(' \\', ' \\<br>&nbsp;')
 
     return render(request, 'index.html', {'body': html})

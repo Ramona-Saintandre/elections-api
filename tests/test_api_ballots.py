@@ -49,8 +49,11 @@ def describe_list():
                 'election': {
                     'url': f'http://testserver/api/elections/{ballot.election.id}/',
                     'id': ballot.election.id,
-                    'name': '',
+                    'name': 'General Election',
+                    'description': '',
+                    'description_edit_url': 'https://github.com/citizenlabsgr/elections-api/edit/master/content/elections/General%20Election.md',
                     'date': '2018-08-07',
+                    'date_humanized': 'Tuesday, August 7th',
                     'active': True,
                     'reference_url': None,
                 },

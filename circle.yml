@@ -3,11 +3,11 @@ version: 2
 jobs:
   build:
     docker:
-      - image: circleci/python:3.7-stretch
+      - image: circleci/python:3.7.5-stretch
         environment:
           DATABASE_URL: postgres://circleci:@127.0.0.1:5432/elections_test
           REDIS_URL: redis://127.0.0.1:6379/0
-      - image: circleci/postgres:9.6-alpine-ram
+      - image: circleci/postgres:11-alpine-ram
         environment:
           - POSTGRES_USER=circleci
           - POSTGRES_DB=elections_test
@@ -15,10 +15,6 @@ jobs:
 
     steps:
       - checkout
-
-      - run:
-          name: Installing system dependencies
-          command: sudo pip install poetry
 
       - run:
           name: Checking system dependencies
@@ -42,7 +38,7 @@ jobs:
 
       - run:
           name: Running tests
-          command: make test && sudo pip install python-coveralls && coveralls
+          command: make test && sudo pip install coveralls "coverage<5" && coveralls
 
       - store_artifacts:
           path: htmlcov

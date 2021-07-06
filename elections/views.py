@@ -1,5 +1,4 @@
-from django.utils.decorators import method_decorator
-from django.views.decorators.cache import cache_page
+from typing import List, Set
 
 from rest_framework import generics, viewsets
 from rest_framework.response import Response
@@ -18,7 +17,6 @@ class RegistrationViewSet(viewsets.ViewSetMixin, generics.ListAPIView):
     filterset_class = filters.VoterFilter
     pagination_class = None
 
-    @method_decorator(cache_page(60))
     def list(self, request):  # pylint: disable=arguments-differ
         input_serializer = serializers.VoterSerializer(data=request.query_params)
         input_serializer.is_valid(raise_exception=True)
@@ -132,9 +130,11 @@ class ProposalViewSet(viewsets.ModelViewSet):
     """
 
     http_method_names = ['get']
-    queryset = models.Proposal.objects.select_related(
-        'election', 'district__category'
-    ).distinct()
+    queryset = (
+        models.Proposal.objects.select_related('election', 'district__category')
+        .order_by('district__category__rank', 'name')
+        .distinct()
+    )
     filter_backends = [filters.DjangoFilterBackend]
     filterset_class = filters.ProposalFilter
     serializer_class = serializers.ProposalSerializer
@@ -190,8 +190,40 @@ class PositionViewSet(viewsets.ModelViewSet):
     queryset = (
         models.Position.objects.select_related('election', 'district__category')
         .prefetch_related('candidates__party')
+        .order_by('district__category__rank', 'name')
         .distinct()
     )
     filter_backends = [filters.DjangoFilterBackend]
     filterset_class = filters.PositionFilter
     serializer_class = serializers.PositionSerializer
+
+    def get_queryset(self):
+        section = self.request.query_params.get('section')
+        if section:
+            return self.queryset.filter(section__in={section, 'Nonpartisan', ''})
+        return self.queryset
+
+
+class GlossaryViewSet(viewsets.ViewSet):
+    """
+    list:
+    Return all glossary terms.
+    """
+
+    http_method_names = ['get']
+    serializer_class = serializers.GlossarySerializer
+
+    def list(self, request):
+        items: List = []
+
+        items.extend(models.DistrictCategory.objects.all())
+        items.extend(models.Election.objects.all())
+
+        positions: Set[str] = set()
+        for position in models.Position.objects.all():
+            if position.name not in positions:
+                positions.add(position.name)
+                items.append(position)
+
+        serializer = self.serializer_class(items, many=True)
+        return Response(serializer.data)
